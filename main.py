@@ -1,0 +1,673 @@
+# main.py - 快捷键修复版 | CPU优化 | 无鼠标转圈 | @Zhl2010
+import os
+import sys
+import json
+import hashlib
+import subprocess
+import threading
+import customtkinter as ctk
+from tkinter import filedialog
+from PIL import Image, ImageDraw
+import ctypes
+from ctypes import wintypes
+import time
+import gc
+
+# 使用 keyboard 库（稳定且 CPU 占用低）
+try:
+    import keyboard
+except ImportError:
+    print("请先安装 keyboard: pip install keyboard")
+    sys.exit(1)
+
+# 确保 pystray 已安装
+try:
+    import pystray
+except ImportError:
+    print("请先安装 pystray: pip install pystray")
+    sys.exit(1)
+
+# ------------------------------- 路径与目录 -------------------------------
+LOG_DIR = "log"
+PASSWORD_FILE = os.path.join(LOG_DIR, "pass")
+SETTINGS_FILE = os.path.join(LOG_DIR, "settings.json")
+ICON_FILE = os.path.join(LOG_DIR, "icon.png")
+
+if not os.path.exists(LOG_DIR):
+    os.makedirs(LOG_DIR)
+
+# ------------------------------- 密码管理器 -------------------------------
+class PasswordManager:
+    PASSWORD_FILE = PASSWORD_FILE
+    SALT = b"lockscreen_secure_salt"
+
+    @classmethod
+    def _hash(cls, pwd):
+        h = hashlib.sha256()
+        h.update(cls.SALT)
+        h.update(pwd.encode('utf-8'))
+        return h.hexdigest()
+
+    @classmethod
+    def initialize(cls):
+        if not os.path.exists(cls.PASSWORD_FILE):
+            cls.save_password("123456")
+            print("初始密码已设为 123456")
+
+    @classmethod
+    def save_password(cls, new_pwd):
+        with open(cls.PASSWORD_FILE, "w") as f:
+            f.write(cls._hash(new_pwd))
+
+    @classmethod
+    def verify(cls, pwd):
+        if not os.path.exists(cls.PASSWORD_FILE):
+            cls.initialize()
+        try:
+            with open(cls.PASSWORD_FILE, "r") as f:
+                stored = f.read().strip()
+            return stored == cls._hash(pwd)
+        except:
+            return False
+
+# ------------------------------- 设置管理器 -------------------------------
+class SettingsManager:
+    SETTINGS_FILE = SETTINGS_FILE
+
+    @classmethod
+    def load(cls):
+        if os.path.exists(cls.SETTINGS_FILE):
+            try:
+                with open(cls.SETTINGS_FILE, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except:
+                pass
+        return {
+            "wallpaper": "",
+            "show_time": False,
+            "transparent_bg": False,
+            "theme": "auto",
+            "hotkey": "ctrl+alt+l",
+            "enable_face_recognition": False,
+            "opacity": 0.96
+        }
+
+    @classmethod
+    def save(cls, settings):
+        with open(cls.SETTINGS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(settings, f, indent=4, ensure_ascii=False)
+
+# ------------------------------- 快捷键管理器（使用 keyboard 库，稳定）------------------------------
+class HotkeyManager:
+    def __init__(self, callback):
+        self.callback = callback
+        self.current_hotkey = None
+        self.listening = False
+
+    def start(self, hotkey_str):
+        if self.listening:
+            self.stop()
+        try:
+            self.current_hotkey = hotkey_str
+            self.listening = True
+            # 使用 keyboard 的 add_hotkey，回调直接调用
+            keyboard.add_hotkey(hotkey_str, self.callback)
+            print(f"[INFO] 快捷键 {hotkey_str} 已注册")
+        except Exception as e:
+            print(f"[ERROR] 注册快捷键失败: {e}")
+            self.listening = False
+
+    def stop(self):
+        if self.current_hotkey:
+            try:
+                keyboard.remove_hotkey(self.current_hotkey)
+                self.listening = False
+                print(f"[INFO] 快捷键 {self.current_hotkey} 已移除")
+            except:
+                pass
+
+    def change_hotkey(self, new_hotkey):
+        self.stop()
+        self.start(new_hotkey)
+
+# ------------------------------- 主界面 -------------------------------
+class MainApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("LockScreen 控制中心")
+        self.geometry("1200x780")
+        self.minsize(1100, 720)
+        self.center_window()
+
+        PasswordManager.initialize()
+        self.settings = SettingsManager.load()
+        opacity = self.settings.get("opacity", 0.96)
+        self.attributes('-alpha', opacity)
+
+        ctk.set_default_color_theme("blue")
+        self._apply_theme(self.settings.get("theme", "auto"))
+
+        self._notify_after_id = None
+        self.hotkey_manager = None
+        self._idle_after_id = None
+
+        # 主布局
+        self.nav_frame = ctk.CTkFrame(self, width=280, corner_radius=0, fg_color=("#f8f9fa", "#0f1419"))
+        self.nav_frame.pack(side="left", fill="y")
+        self.nav_frame.pack_propagate(False)
+
+        self.content_frame = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
+        self.content_frame.pack(side="right", fill="both", expand=True)
+
+        self._build_navbar()
+        self._build_content_area()
+
+        self.notify_label = ctk.CTkLabel(
+            self, text="", font=ctk.CTkFont(size=12),
+            corner_radius=12, padx=20, pady=10
+        )
+        self.notify_label.place(relx=0.5, y=self.winfo_height()-50, anchor="s")
+        self.notify_label.lower()
+
+        self._start_hotkey_listener()
+        self.after(200, self._start_tray_thread)
+
+        self.protocol("WM_DELETE_WINDOW", self.hide_window)
+        self.after(50, self._bring_to_front)
+
+        # 启动长间隔空闲循环（降低 CPU）
+        self._start_idle_loop()
+
+    def center_window(self):
+        self.update_idletasks()
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        self.geometry(f"1200x780+{sw//2-600}+{sh//2-390}")
+
+    def _start_idle_loop(self):
+        """长间隔空闲循环，减少主循环唤醒频率"""
+        if self._idle_after_id:
+            self.after_cancel(self._idle_after_id)
+        # 每 30 秒执行一次，仅为维持 after 队列，不做事
+        self._idle_after_id = self.after(30000, self._start_idle_loop)
+
+    def _build_navbar(self):
+        logo_frame = ctk.CTkFrame(self.nav_frame, fg_color="transparent", height=100)
+        logo_frame.pack(fill="x", pady=(40, 20))
+        ctk.CTkLabel(logo_frame, text="LockScreen", font=ctk.CTkFont(size=28, weight="bold"), text_color="#F59E0B").pack()
+        ctk.CTkLabel(logo_frame, text="Control Center", font=ctk.CTkFont(size=12), text_color="#64748B").pack()
+        ctk.CTkFrame(self.nav_frame, height=1, fg_color="#E2E8F0").pack(fill="x", padx=24, pady=15)
+
+        self.nav_btns = {}
+        nav_items = [
+            ("[家] 仪表板", "home"), ("[键] 快捷键", "hotkey"), ("[锁] 密码管理", "password"),
+            ("[笔] 外观设置", "appearance"), ("[齿] 高级设置", "settings"), ("[i] 关于", "about")
+        ]
+        for text, key in nav_items:
+            btn = ctk.CTkButton(
+                self.nav_frame, text=text, font=ctk.CTkFont(size=14, weight="bold"),
+                fg_color="transparent", text_color="#475569", hover_color="#E2E8F0",
+                anchor="w", corner_radius=12, height=45,
+                command=lambda k=key: self._switch_content(k)
+            )
+            btn.pack(fill="x", padx=16, pady=4)
+            self.nav_btns[key] = btn
+
+        bottom_frame = ctk.CTkFrame(self.nav_frame, fg_color="transparent")
+        bottom_frame.pack(side="bottom", fill="x", pady=25)
+
+        ctk.CTkLabel(bottom_frame, text="主题", font=ctk.CTkFont(size=12), text_color="#64748B").pack(anchor="w", padx=24, pady=(0,5))
+        self.theme_var = ctk.StringVar(value=self._theme_to_display(self.settings.get("theme", "auto")))
+        theme_menu = ctk.CTkOptionMenu(
+            bottom_frame, values=["浅色", "深色", "自动"], variable=self.theme_var,
+            command=self._change_theme, font=ctk.CTkFont(size=13), corner_radius=10
+        )
+        theme_menu.pack(padx=20, pady=(0, 15), fill="x")
+
+        ctk.CTkLabel(bottom_frame, text="透明度", font=ctk.CTkFont(size=12), text_color="#64748B").pack(anchor="w", padx=24, pady=(0,5))
+        self.opacity_slider = ctk.CTkSlider(
+            bottom_frame, from_=0.7, to=1.0, number_of_steps=30,
+            command=self._change_opacity, button_color="#F59E0B", progress_color="#F59E0B"
+        )
+        self.opacity_slider.set(self.settings.get("opacity", 0.96))
+        self.opacity_slider.pack(padx=20, pady=(0, 15), fill="x")
+
+        hotkey_text = self.settings.get("hotkey", "ctrl+alt+l")
+        self.nav_hotkey_label = ctk.CTkLabel(bottom_frame, text=f"快捷键: {hotkey_text}", font=ctk.CTkFont(size=11), text_color="#10B981")
+        self.nav_hotkey_label.pack(pady=(0, 15))
+
+    def _build_content_area(self):
+        self.content_cards = {}
+        for key in ["home", "hotkey", "password", "appearance", "settings", "about"]:
+            card = ctk.CTkFrame(self.content_frame, corner_radius=28, fg_color=("white", "#1E293B"))
+            card.pack(fill="both", expand=True, padx=28, pady=28)
+            card.pack_forget()
+            self.content_cards[key] = card
+
+        self._build_home_ui(self.content_cards["home"])
+        self._build_hotkey_ui(self.content_cards["hotkey"])
+        self._build_password_ui(self.content_cards["password"])
+        self._build_appearance_ui(self.content_cards["appearance"])
+        self._build_settings_ui(self.content_cards["settings"])
+        self._build_about_ui(self.content_cards["about"])
+        self._switch_content("home")
+
+    def _build_home_ui(self, parent):
+        welcome_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        welcome_frame.pack(fill="x", padx=36, pady=(32, 16))
+        ctk.CTkLabel(welcome_frame, text="欢迎回来", font=ctk.CTkFont(size=32, weight="bold"), text_color="#F59E0B").pack(anchor="w")
+        ctk.CTkLabel(welcome_frame, text="LockScreen 始终守护您的隐私", font=ctk.CTkFont(size=14), text_color="#64748B").pack(anchor="w")
+
+        grid_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        grid_frame.pack(fill="both", expand=True, padx=36, pady=16)
+
+        lock_card = self._create_glass_card(grid_frame, "[锁]", "立即锁屏", "一键保护屏幕", "#EF4444")
+        lock_card.pack(side="left", fill="both", expand=True, padx=12, pady=12)
+        ctk.CTkButton(lock_card, text="启动", command=self._launch_lockscreen, fg_color="#EF4444", hover_color="#DC2626",
+                      corner_radius=16, height=48, width=160, font=ctk.CTkFont(size=15, weight="bold")).pack(pady=(20, 28))
+
+        face_card = self._create_glass_card(grid_frame, "[人]", "人脸识别", "联动锁屏程序", "#3B82F6")
+        face_card.pack(side="left", fill="both", expand=True, padx=12, pady=12)
+        self.face_status = ctk.CTkLabel(face_card, text="已禁用" if not self.settings.get("enable_face_recognition") else "已启用",
+                                        font=ctk.CTkFont(size=13), text_color="#F59E0B" if self.settings.get("enable_face_recognition") else "#94A3B8")
+        self.face_status.pack(pady=5)
+        ctk.CTkButton(face_card, text="前往设置", command=lambda: self._switch_content("settings"), fg_color="#3B82F6",
+                      hover_color="#2563EB", corner_radius=16, height=48, width=160, font=ctk.CTkFont(size=15, weight="bold")).pack(pady=(20, 28))
+
+        hotkey_card = self._create_glass_card(grid_frame, "[键]", "当前快捷键", "可自定义修改", "#8B5CF6")
+        hotkey_card.pack(side="left", fill="both", expand=True, padx=12, pady=12)
+        self.home_hotkey_label = ctk.CTkLabel(hotkey_card, text=self.settings.get("hotkey", "ctrl+alt+l"),
+                                              font=ctk.CTkFont(size=16, weight="bold"), text_color="#10B981")
+        self.home_hotkey_label.pack()
+        ctk.CTkButton(hotkey_card, text="修改", command=lambda: self._switch_content("hotkey"), fg_color="#8B5CF6",
+                      hover_color="#7C3AED", corner_radius=16, height=48, width=160, font=ctk.CTkFont(size=15, weight="bold")).pack(pady=(20, 28))
+
+        info_frame = ctk.CTkFrame(parent, fg_color="transparent", corner_radius=24)
+        info_frame.pack(fill="x", padx=36, pady=(20, 32))
+        left_info = ctk.CTkFrame(info_frame, fg_color="transparent")
+        left_info.pack(side="left", fill="both", expand=True, padx=20)
+        right_info = ctk.CTkFrame(info_frame, fg_color="transparent")
+        right_info.pack(side="right", fill="both", expand=True, padx=20)
+
+        ctk.CTkLabel(left_info, text="系统状态", font=ctk.CTkFont(size=16, weight="bold"), text_color="#475569").pack(anchor="w", pady=(0,12))
+        listening_status = "● 激活" if self.hotkey_manager and self.hotkey_manager.listening else "○ 未激活"
+        face_status_text = "● 开启" if self.settings.get("enable_face_recognition") else "○ 关闭"
+        lock_available = "● 可用" if self._find_lockscreen_path() else "○ 缺失"
+        ctk.CTkLabel(left_info, text=f"快捷键监听: {listening_status}", font=ctk.CTkFont(size=13)).pack(anchor="w", pady=5)
+        ctk.CTkLabel(left_info, text=f"人脸识别联动: {face_status_text}", font=ctk.CTkFont(size=13)).pack(anchor="w", pady=5)
+        ctk.CTkLabel(left_info, text=f"锁屏程序: {lock_available}", font=ctk.CTkFont(size=13)).pack(anchor="w", pady=5)
+
+        ctk.CTkLabel(right_info, text="使用提示", font=ctk.CTkFont(size=16, weight="bold"), text_color="#475569").pack(anchor="w", pady=(0,12))
+        tips = ["• 快捷键全局生效，支持组合键", "• 启用人脸识别后锁屏同时启动识别", "• 默认密码: 123456，请及时修改", "• 右键系统托盘图标可快速操作"]
+        for tip in tips:
+            ctk.CTkLabel(right_info, text=tip, font=ctk.CTkFont(size=13), text_color="#64748B").pack(anchor="w", pady=3)
+
+    def _create_glass_card(self, parent, icon, title, subtitle, accent_color):
+        card = ctk.CTkFrame(parent, corner_radius=24, fg_color=("white", "#1E293B"), border_width=1,
+                            border_color=("#E2E8F0", "#2D3A5E"))
+        ctk.CTkLabel(card, text=icon, font=ctk.CTkFont(size=48)).pack(pady=(28, 8))
+        ctk.CTkLabel(card, text=title, font=ctk.CTkFont(size=20, weight="bold")).pack()
+        ctk.CTkLabel(card, text=subtitle, font=ctk.CTkFont(size=12), text_color="#64748B").pack()
+        def on_enter(e): card.configure(border_color=accent_color, border_width=2)
+        def on_leave(e): card.configure(border_color=("#E2E8F0", "#2D3A5E"), border_width=1)
+        card.bind("<Enter>", on_enter); card.bind("<Leave>", on_leave)
+        return card
+
+    def _build_hotkey_ui(self, parent):
+        self._build_simple_setting_page(parent, "快捷键配置", "自定义快速锁屏的组合键",
+            [("快捷键组合:", "hotkey_entry", "例: ctrl+alt+l")], self._apply_hotkey, "应用")
+
+    def _build_password_ui(self, parent):
+        fields = [("原密码:", "old_pwd", ""), ("新密码:", "new_pwd", ""), ("确认新密码:", "confirm_pwd", "")]
+        self.pwd_entries = {}
+        header = ctk.CTkFrame(parent, fg_color="transparent")
+        header.pack(fill="x", padx=36, pady=(36, 20))
+        ctk.CTkLabel(header, text="密码管理", font=ctk.CTkFont(size=26, weight="bold"), text_color="#F59E0B").pack(anchor="w")
+        ctk.CTkLabel(header, text="修改锁屏密码，保护隐私安全", font=ctk.CTkFont(size=13), text_color="#64748B").pack(anchor="w")
+        card = ctk.CTkFrame(parent, corner_radius=24, fg_color=("white", "#1E293B"))
+        card.pack(fill="x", padx=36, pady=16)
+        for label, key, _ in fields:
+            frame = ctk.CTkFrame(card, fg_color="transparent")
+            frame.pack(fill="x", padx=28, pady=15)
+            ctk.CTkLabel(frame, text=label, font=ctk.CTkFont(size=14, weight="bold"), width=100, anchor="e").pack(side="left", padx=(0,16))
+            entry = ctk.CTkEntry(frame, show="●", font=ctk.CTkFont(size=14), corner_radius=12, height=44)
+            entry.pack(side="left", fill="x", expand=True)
+            self.pwd_entries[key] = entry
+        btn_frame = ctk.CTkFrame(card, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=28, pady=(20, 32))
+        ctk.CTkButton(btn_frame, text="修改密码", command=self._change_password, fg_color="#2563EB", hover_color="#1D4ED8", width=140, font=ctk.CTkFont(size=14, weight="bold"), height=44, corner_radius=14).pack(side="left", padx=(0, 16))
+        ctk.CTkButton(btn_frame, text="清空", command=self._clear_password_fields, fg_color="#475569", hover_color="#334155", width=110, font=ctk.CTkFont(size=14), height=44, corner_radius=14).pack(side="left")
+        tip_frame = ctk.CTkFrame(card, fg_color="transparent")
+        tip_frame.pack(fill="x", padx=28, pady=(0, 24))
+        ctk.CTkLabel(tip_frame, text="提示: 密码采用 SHA256 加密存储，请务必牢记。", font=ctk.CTkFont(size=11), text_color="#64748B").pack(anchor="w")
+
+    def _build_appearance_ui(self, parent):
+        header = ctk.CTkFrame(parent, fg_color="transparent")
+        header.pack(fill="x", padx=36, pady=(36, 20))
+        ctk.CTkLabel(header, text="外观设置", font=ctk.CTkFont(size=26, weight="bold"), text_color="#F59E0B").pack(anchor="w")
+        ctk.CTkLabel(header, text="自定义锁屏界面样式", font=ctk.CTkFont(size=13), text_color="#64748B").pack(anchor="w")
+        scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent", corner_radius=0)
+        scroll.pack(fill="both", expand=True, padx=36, pady=16)
+        self.trans_var = ctk.BooleanVar(value=self.settings.get("transparent_bg", False))
+        trans_sw = ctk.CTkSwitch(scroll, text="透明背景模式 (忽略壁纸)", variable=self.trans_var, command=self._on_transparent_toggle, font=ctk.CTkFont(size=14), switch_width=50)
+        trans_sw.pack(anchor='w', pady=16, padx=20)
+        self.wall_group = ctk.CTkFrame(scroll, fg_color="transparent")
+        self.wall_group.pack(fill='x', pady=10, padx=20)
+        path_frame = ctk.CTkFrame(self.wall_group, fg_color="transparent")
+        path_frame.pack(fill='x', pady=6)
+        self.wall_entry = ctk.CTkEntry(path_frame, placeholder_text="选择壁纸图片", width=500, corner_radius=14)
+        self.wall_entry.pack(side='left', padx=(0, 12), fill='x', expand=True)
+        self.wall_entry.insert(0, self.settings.get("wallpaper", ""))
+        self.browse_btn = ctk.CTkButton(path_frame, text="浏览", command=self._browse_wallpaper, width=90, corner_radius=14)
+        self.browse_btn.pack(side='left')
+        self.preview_img = ctk.CTkLabel(self.wall_group, text="", width=680, height=180, corner_radius=20, fg_color=("#EFF3F8", "#2D2D3F"))
+        self.preview_img.pack(pady=16)
+        if not self.trans_var.get() and self.settings.get("wallpaper"):
+            self._update_preview(self.settings["wallpaper"])
+        else:
+            self.preview_img.configure(text="(暂无预览)")
+        self.time_var = ctk.BooleanVar(value=self.settings.get("show_time", False))
+        time_sw = ctk.CTkSwitch(scroll, text="锁屏时显示当前时间 (左下角)", variable=self.time_var, command=self._on_time_toggle, font=ctk.CTkFont(size=14), switch_width=50)
+        time_sw.pack(anchor='w', pady=20, padx=20)
+        self._update_wallpaper_access()
+
+    def _build_settings_ui(self, parent):
+        self._build_simple_setting_page(parent, "高级设置", "扩展功能与联动选项",
+            [("启用人脸识别联动", "face_toggle", "")], None, None, is_switch=True)
+
+    def _build_about_ui(self, parent):
+        header = ctk.CTkFrame(parent, fg_color="transparent")
+        header.pack(fill="x", padx=36, pady=(36, 20))
+        ctk.CTkLabel(header, text="关于 LockScreen", font=ctk.CTkFont(size=26, weight="bold"), text_color="#F59E0B").pack(anchor="w")
+        card = ctk.CTkFrame(parent, corner_radius=24, fg_color=("white", "#1E293B"))
+        card.pack(fill="both", expand=True, padx=36, pady=16)
+        logo_area = ctk.CTkFrame(card, fg_color="transparent")
+        logo_area.pack(pady=(40, 20))
+        ctk.CTkLabel(logo_area, text="LS", font=ctk.CTkFont(size=56, weight="bold"), text_color="#F59E0B").pack()
+        ctk.CTkLabel(logo_area, text="LockScreen Control Center", font=ctk.CTkFont(size=18, weight="bold"), text_color="#F59E0B").pack()
+        features = ["全屏锁屏保护", "自定义快捷键", "人脸识别联动", "SHA256 加密密码", "系统托盘集成"]
+        features_text = "功能特性:\n" + "\n".join(f"• {f}" for f in features)
+        ctk.CTkLabel(card, text=features_text, justify="left", font=ctk.CTkFont(size=13), text_color="#475569").pack(anchor="center", pady=10)
+        dev_frame = ctk.CTkFrame(card, fg_color="transparent")
+        dev_frame.pack(pady=(10, 30))
+        ctk.CTkLabel(dev_frame, text="开发者", font=ctk.CTkFont(size=14, weight="bold")).pack()
+        ctk.CTkLabel(dev_frame, text="@Zhl2010", font=ctk.CTkFont(size=24, weight="bold"), text_color="#F59E0B").pack()
+        ctk.CTkLabel(card, text="版本 2.0 Enhanced", font=ctk.CTkFont(size=11), text_color="#64748B").pack(pady=(0, 20))
+
+    def _build_simple_setting_page(self, parent, title, subtitle, fields, apply_cmd, apply_text, is_switch=False):
+        header = ctk.CTkFrame(parent, fg_color="transparent")
+        header.pack(fill="x", padx=36, pady=(36, 20))
+        ctk.CTkLabel(header, text=title, font=ctk.CTkFont(size=26, weight="bold"), text_color="#F59E0B").pack(anchor="w")
+        ctk.CTkLabel(header, text=subtitle, font=ctk.CTkFont(size=13), text_color="#64748B").pack(anchor="w")
+        card = ctk.CTkFrame(parent, corner_radius=24, fg_color=("white", "#1E293B"))
+        card.pack(fill="x", padx=36, pady=16)
+        if is_switch:
+            self.face_var = ctk.BooleanVar(value=self.settings.get("enable_face_recognition", False))
+            sw = ctk.CTkSwitch(card, text="启用人脸识别联动", variable=self.face_var, command=self._on_face_toggle,
+                               font=ctk.CTkFont(size=15, weight="bold"), progress_color="#4CAF50", button_color="#2563EB")
+            sw.pack(anchor='w', padx=28, pady=20)
+            info_container = ctk.CTkFrame(card, corner_radius=16, border_width=1, fg_color="transparent")
+            info_container.pack(fill="x", padx=28, pady=(10, 28))
+            ctk.CTkLabel(info_container, text="功能说明", font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w", padx=20, pady=(16, 8))
+            ctk.CTkLabel(info_container, text="• 人脸识别需要单独的 recognize.exe 程序放在同一目录下\n• 识别成功后会自动解锁屏幕\n• 若未找到 recognize.exe，仅锁屏功能正常",
+                         justify="left", font=ctk.CTkFont(size=12), text_color="#64748B").pack(anchor="w", padx=20, pady=(0, 16))
+        else:
+            input_frame = ctk.CTkFrame(card, fg_color="transparent")
+            input_frame.pack(fill="x", padx=28, pady=20)
+            ctk.CTkLabel(input_frame, text=fields[0][0], font=ctk.CTkFont(size=14, weight="bold"), width=120, anchor="e").pack(side="left", padx=(0,16))
+            entry = ctk.CTkEntry(input_frame, placeholder_text=fields[0][2], font=ctk.CTkFont(size=14), width=280, corner_radius=12, height=44)
+            entry.pack(side="left", padx=(0,16))
+            entry.insert(0, self.settings.get("hotkey", "ctrl+alt+l"))
+            self.hotkey_entry = entry
+            ctk.CTkButton(input_frame, text=apply_text, command=apply_cmd, fg_color="#4CAF50", hover_color="#388E3C", width=110,
+                          font=ctk.CTkFont(size=14, weight="bold"), height=44, corner_radius=12).pack(side="left")
+            ctk.CTkLabel(card, text="支持组合键: Ctrl / Shift / Alt / Win + 字母/数字/功能键", font=ctk.CTkFont(size=12), text_color="#64748B").pack(anchor="w", padx=28, pady=(0, 28))
+
+    # ---------- 核心功能 ----------
+    def _apply_theme(self, mode):
+        if mode == "light":
+            ctk.set_appearance_mode("light")
+        elif mode == "dark":
+            ctk.set_appearance_mode("dark")
+        else:
+            ctk.set_appearance_mode("system")
+
+    def _theme_to_display(self, mode):
+        return {"light": "浅色", "dark": "深色", "system": "自动"}.get(mode, "自动")
+
+    def _change_theme(self, choice):
+        mode = {"浅色": "light", "深色": "dark", "自动": "system"}[choice]
+        self._apply_theme(mode)
+        self.settings["theme"] = mode
+        SettingsManager.save(self.settings)
+        self._show_notification("主题已切换")
+
+    def _change_opacity(self, value):
+        opacity = float(value)
+        self.attributes('-alpha', opacity)
+        self.settings["opacity"] = opacity
+        SettingsManager.save(self.settings)
+
+    def _switch_content(self, key):
+        for card in self.content_cards.values():
+            card.pack_forget()
+        self.content_cards[key].pack(fill="both", expand=True, padx=28, pady=28)
+        for k, btn in self.nav_btns.items():
+            btn.configure(fg_color="transparent", text_color="#475569")
+        if key in self.nav_btns:
+            self.nav_btns[key].configure(fg_color="#E2E8F0", text_color="#0F1419")
+
+    def _show_notification(self, msg, is_err=False):
+        if self._notify_after_id:
+            self.after_cancel(self._notify_after_id)
+        color = "#DC2626" if is_err else "#10B981"
+        self.notify_label.configure(text=msg, fg_color=color, text_color="white")
+        self.notify_label.place(relx=0.5, y=self.winfo_height()-50, anchor="s")
+        self._notify_after_id = self.after(2500, self._hide_notification)
+
+    def _hide_notification(self):
+        self.notify_label.place_forget()
+        self._notify_after_id = None
+
+    def _find_lockscreen_path(self):
+        base = os.path.dirname(os.path.abspath(sys.argv[0]))
+        for name in ['lockscreen.exe', 'lockscreen_enhanced.py', 'lockscreen.py']:
+            path = os.path.join(base, name)
+            if os.path.exists(path):
+                return path
+        return None
+
+    def _launch_lockscreen(self):
+        """启动锁屏，无鼠标转圈优化"""
+        path = self._find_lockscreen_path()
+        if not path:
+            self._show_notification("未找到锁屏程序", is_err=True)
+            return
+        try:
+            # 隐藏控制台窗口，避免鼠标转圈
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+            if path.endswith('.exe'):
+                subprocess.Popen([path], creationflags=subprocess.CREATE_NO_WINDOW, startupinfo=startupinfo)
+            else:
+                subprocess.Popen([sys.executable, path], creationflags=subprocess.CREATE_NO_WINDOW, startupinfo=startupinfo)
+
+            if self.settings.get("enable_face_recognition", False):
+                base = os.path.dirname(os.path.abspath(sys.argv[0]))
+                recog_path = os.path.join(base, "recognize.exe")
+                if os.path.exists(recog_path):
+                    subprocess.Popen([recog_path], creationflags=subprocess.CREATE_NO_WINDOW, startupinfo=startupinfo)
+        except Exception as e:
+            self._show_notification(f"启动失败: {str(e)}", is_err=True)
+
+    def _apply_hotkey(self):
+        new_hotkey = self.hotkey_entry.get().strip().lower()
+        if not new_hotkey:
+            self._show_notification("快捷键不能为空", is_err=True)
+            return
+        try:
+            self.hotkey_manager.change_hotkey(new_hotkey)
+            self.settings["hotkey"] = new_hotkey
+            SettingsManager.save(self.settings)
+            self.nav_hotkey_label.configure(text=f"快捷键: {new_hotkey}")
+            self.home_hotkey_label.configure(text=new_hotkey)
+            self._show_notification(f"快捷键已改为 {new_hotkey}")
+        except Exception as e:
+            self._show_notification(f"设置失败: {str(e)}", is_err=True)
+
+    def _change_password(self):
+        old = self.pwd_entries["old_pwd"].get()
+        new = self.pwd_entries["new_pwd"].get()
+        cf = self.pwd_entries["confirm_pwd"].get()
+        if not old:
+            self._show_notification("请输入原密码", is_err=True)
+            return
+        if not PasswordManager.verify(old):
+            self._show_notification("原密码错误", is_err=True)
+            return
+        if not new:
+            self._show_notification("请输入新密码", is_err=True)
+            return
+        if new != cf:
+            self._show_notification("两次密码不一致", is_err=True)
+            return
+        PasswordManager.save_password(new)
+        self._show_notification("密码修改成功")
+        self._clear_password_fields()
+
+    def _clear_password_fields(self):
+        for entry in self.pwd_entries.values():
+            entry.delete(0, 'end')
+
+    def _on_face_toggle(self):
+        enabled = self.face_var.get()
+        self.settings["enable_face_recognition"] = enabled
+        SettingsManager.save(self.settings)
+        self.face_status.configure(text="已启用" if enabled else "已禁用")
+        self.face_status.configure(text_color="#F59E0B" if enabled else "#94A3B8")
+        self._show_notification(f"人脸识别联动 {'已开启' if enabled else '已关闭'}")
+
+    def _update_wallpaper_access(self):
+        if self.trans_var.get():
+            self.wall_entry.configure(state="disabled")
+            self.browse_btn.configure(state="disabled")
+            self.preview_img.configure(image=None, text="透明模式已开启，不显示壁纸")
+        else:
+            self.wall_entry.configure(state="normal")
+            self.browse_btn.configure(state="normal")
+            wp = self.settings.get("wallpaper", "")
+            if wp:
+                self._update_preview(wp)
+            else:
+                self.preview_img.configure(image=None, text="(未选择壁纸)")
+
+    def _on_transparent_toggle(self):
+        new_val = self.trans_var.get()
+        self.settings["transparent_bg"] = new_val
+        SettingsManager.save(self.settings)
+        self._update_wallpaper_access()
+        self._show_notification("透明模式已" + ("开启" if new_val else "关闭"))
+
+    def _browse_wallpaper(self):
+        if self.trans_var.get():
+            return
+        path = filedialog.askopenfilename(filetypes=[("图片", "*.png *.jpg *.jpeg *.bmp *.gif")])
+        if path:
+            self.wall_entry.delete(0, 'end')
+            self.wall_entry.insert(0, path)
+            self._save_wallpaper_path(path)
+
+    def _save_wallpaper_path(self, path):
+        if not path or not os.path.isfile(path):
+            self._show_notification("文件不存在", is_err=True)
+            return
+        self.settings["wallpaper"] = path
+        if self.settings["transparent_bg"]:
+            self.settings["transparent_bg"] = False
+            self.trans_var.set(False)
+            self._update_wallpaper_access()
+        SettingsManager.save(self.settings)
+        self._update_preview(path)
+        self._show_notification("壁纸已保存")
+
+    def _update_preview(self, path):
+        try:
+            img = Image.open(path)
+            img.thumbnail((660, 160), Image.Resampling.LANCZOS)
+            photo = ctk.CTkImage(img, size=(img.width, img.height))
+            self.preview_img.configure(image=photo, text="")
+            self.preview_img.image = photo
+        except Exception:
+            self.preview_img.configure(image=None, text="预览失败")
+
+    def _on_time_toggle(self):
+        self.settings["show_time"] = self.time_var.get()
+        SettingsManager.save(self.settings)
+        self._show_notification("时间显示" + ("已开启" if self.time_var.get() else "已关闭"))
+
+    def _start_hotkey_listener(self):
+        hotkey_str = self.settings.get("hotkey", "ctrl+alt+l")
+        self.hotkey_manager = HotkeyManager(self._on_hotkey_pressed)
+        try:
+            self.hotkey_manager.start(hotkey_str)
+        except Exception as e:
+            print(f"[ERROR] 快捷键初始化失败: {e}")
+
+    def _on_hotkey_pressed(self):
+        self._launch_lockscreen()
+
+    def _start_tray_thread(self):
+        self.tray_thread = threading.Thread(target=self._setup_tray, daemon=True)
+        self.tray_thread.start()
+
+    def _create_tray_icon(self):
+        size = 64
+        img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        draw.arc((20, 12, 44, 36), start=0, end=180, fill=(100, 150, 100), width=5)
+        draw.rounded_rectangle((14, 30, 50, 58), radius=10, fill=(120, 180, 120), outline=(60, 100, 60))
+        draw.ellipse((28, 42, 36, 50), fill=(40, 70, 40))
+        draw.rectangle((30, 48, 34, 55), fill=(40, 70, 40))
+        return img
+
+    def _setup_tray(self):
+        if os.path.exists(ICON_FILE):
+            try:
+                icon_img = Image.open(ICON_FILE).resize((64, 64), Image.Resampling.LANCZOS)
+            except:
+                icon_img = self._create_tray_icon()
+        else:
+            icon_img = self._create_tray_icon()
+        menu = pystray.Menu(
+            pystray.MenuItem("立即锁屏", lambda: self._launch_lockscreen()),
+            pystray.MenuItem("显示主窗口", lambda: self.show_window()),
+            pystray.MenuItem("退出程序", self._quit_app)
+        )
+        icon = pystray.Icon("lockscreen_main", icon_img, "LockScreen", menu)
+        icon.run()
+
+    def hide_window(self):
+        self.withdraw()
+        gc.collect()
+
+    def show_window(self):
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+        self._bring_to_front()
+
+    def _bring_to_front(self):
+        self.lift()
+        self.focus_force()
+        self.attributes('-topmost', True)
+        self.after(300, lambda: self.attributes('-topmost', False))
+
+    def _quit_app(self):
+        if self.hotkey_manager:
+            self.hotkey_manager.stop()
+        self.quit()
+        os._exit(0)
+
+if __name__ == "__main__":
+    app = MainApp()
+    app.mainloop()
